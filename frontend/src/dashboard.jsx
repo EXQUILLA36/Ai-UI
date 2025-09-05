@@ -67,7 +67,6 @@ function Dashboard({goChat, goAccounts,goLogin}) {
     localStorage.removeItem("studentId"); // clear saved session
     goLogin(); // go back to Login page
   };
-
   return (
     <>
     <div className="flex flex-col">

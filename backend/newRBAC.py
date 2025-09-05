@@ -110,8 +110,3 @@ def get_all_students(requesting_user_id):
             "role": data["role"]
         })
     return result
-
-def collect_data():
-    ai = SmartStudentDataSystem()
-    ai.Autoload_new_data()
-    return ai.collections

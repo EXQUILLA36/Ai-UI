@@ -3,7 +3,8 @@ import json
 from flask import Flask, request, jsonify #type: ignore 
 from flask_cors import CORS #type: ignore
 from utils.LLM_model import AIAnalyst
-from newRBAC import create_student_account, verify_password, load_students, decrypt_data, collect_data
+from utils.Security import collect_data
+from newRBAC import create_student_account, verify_password, load_students, decrypt_data
 from urllib.parse import unquote
 import json
 
@@ -108,7 +109,6 @@ def upload_file():
     ai = AIAnalyst(collections, llm_config=full_config, execution_mode=api_mode)
     
     return jsonify({"message": "File uploaded successfully!", "filename": file.filename}), 200
-    ai = AIAnalyst(collections, llm_cfg)
     
 @app.route("/delete_upload/<category>/<filename>", methods=["DELETE"])
 def delete_upload(category, filename):
@@ -123,7 +123,6 @@ def delete_upload(category, filename):
         return jsonify({"message": "File deleted"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/chatprompt", methods=["POST"])
 def ChatPrompt():

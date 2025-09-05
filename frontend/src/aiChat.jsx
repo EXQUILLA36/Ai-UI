@@ -50,6 +50,8 @@ function AiChat({ messages, input, setInput, handleSubmit, boxRef, studentData }
                       ? "bg-amber-600 userRespo self-end !rounded-sm"
                       : msg.type === "schedule"
                       ? "bg-amber-100 border border-gray-400 self-start text-sm whitespace-pre-wrap"
+                      : msg.type === "lists"
+                      ? "bg-amber-100 border border-gray-400 self-start text-sm whitespace-pre-wrap"
                       : msg.type === "loading"
                       ? "bg-gray-600/50 w-20 self-start !rounded-sm"
                       : "bg-amber-200 botRespo self-start break-words !rounded-sm"
@@ -59,8 +61,6 @@ function AiChat({ messages, input, setInput, handleSubmit, boxRef, studentData }
                     <div className="flex gap-1 w-full items-center">
                       <span className="chatLoader"></span>
                     </div>
-                  ) : isBotResponse && isLastMessage ? (
-                    <TypewriterText text={msg.text} speed={20} />
                   ) : (
                     msg.text
                   )}

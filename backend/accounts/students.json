@@ -53,6 +53,6 @@
         "course": "gAAAAABotu7EDxHLcPxiGrUl6Mgt79r811FZK57nT4ySBgoE3M4daJ5uKlnlX8LBnsVo_Zw4uMjRwZ0n5Te4Zu3vMtKOgv2GEA==",
         "email": "gAAAAABotu7E93VLgKMZVezhZYIg6avqvCDMqsgAEJvofhAcWzT8gQCFPZJlI1K3R8Pgx7cbwOfkP_-QEq_YL5Nris6Gu7XR59gH5UnFxiCItmRAlIK7v9k=",
         "password": "scrypt:32768:8:1$0RSbWiiPksuiPf1b$530b29118744624ee464755ed29e1e17680e5dbe4ac89576e2c307dddeecc21cffbaf20f39ea302b07192c7ac06e5ab7a94e206d64bba9448716cbd87fdb49e3",
-        "role": "faculty"
+        "role": "student"
     }
 }

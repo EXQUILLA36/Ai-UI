@@ -5,9 +5,9 @@ import chromadb #type: ignore
 from chromadb.config import Settings #type: ignore
 from sentence_transformers import SentenceTransformer #type: ignore
 import warnings #type: ignore
-import pandas as pd
+import pandas as pd #type: ignore
 import os
-import fitz # PyMuPDF
+import fitz # PyMuPDF #type: ignore 
 import re
 from datetime import datetime
 from chromadb.utils import embedding_functions # Import for consistent embedding function
@@ -20,10 +20,22 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 class SmartStudentDataSystem:
     def __init__(self):
-        self.client = chromadb.PersistentClient(path="./database/chroma_store")
-        # Initialize the SentenceTransformer model for 384-dimensional embeddings
-        self.model = SentenceTransformer("all-MiniLM-L6-v2") 
-        # Define the embedding function for ChromaDB to use, ensuring consistency
+        # Base storage path
+        self.base_path = Path(__name__).resolve().parent / 'database' / 'chroma_store'
+        
+        # Create main folders if they don't exist
+        self.teaching_faculty_path = os.path.join(self.base_path, "Teaching_Faculty")
+        self.non_faculty_path = os.path.join(self.base_path, "Non_Faculty")
+        self.admin_path = os.path.join(self.base_path, "Admin")
+        
+        # Create directories
+        os.makedirs(self.teaching_faculty_path, exist_ok=True)
+        os.makedirs(self.non_faculty_path, exist_ok=True)
+        os.makedirs(self.admin_path, exist_ok=True)
+        
+        # Initialize with default path (will be changed per collection)
+        self.client = None
+        self.model = SentenceTransformer("all-MiniLM-L6-v2")
         self.embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name="all-MiniLM-L6-v2"
         )
@@ -83,26 +95,191 @@ class SmartStudentDataSystem:
             except KeyboardInterrupt:
                 break
         print("\n↩️ Returning to main menu...")
-            
+        
+    def get_storage_path(self, data_type, metadata=None):
+        """Get appropriate storage path based on data type and metadata"""
+        
+        if data_type in ['teaching_faculty', 'teaching_faculty_excel', 'teaching_faculty_resume_pdf']:
+            return self.teaching_faculty_path
+        
+        elif data_type == 'teaching_faculty_schedule':
+            # Teaching faculty schedules go to Teaching Faculty folder
+            return self.teaching_faculty_path
+        
+        elif data_type == 'student_cor_schedule':
+            # Student COR schedules go under Teaching Faculty > Department > Course structure
+            if metadata:
+                department = metadata.get('department', 'UNKNOWN')
+                course = metadata.get('course', 'GENERAL')
+                
+                # Create department folder under Teaching Faculty
+                dept_path = os.path.join(self.teaching_faculty_path, f"Department_{department}")
+                os.makedirs(dept_path, exist_ok=True)
+                
+                # Create course folder under department
+                course_path = os.path.join(dept_path, course)
+                os.makedirs(course_path, exist_ok=True)
+                
+                return course_path
+            else:
+                return self.teaching_faculty_path
+        
+        elif data_type in ['student', 'student_universal', 'student_pdf', 'student_grades', 'student_grades_pdf', 'cor_schedule', 'student_cor_schedule']:
+            # Student data and COR schedules go under Teaching Faculty > Department > Course structure
+            if metadata:
+                department = metadata.get('department', 'UNKNOWN')
+                course = metadata.get('course', 'GENERAL')
+                
+                # Create department folder under Teaching Faculty
+                dept_path = os.path.join(self.teaching_faculty_path, f"Department_{department}")
+                os.makedirs(dept_path, exist_ok=True)
+                
+                # Create course folder under department
+                course_path = os.path.join(dept_path, course)
+                os.makedirs(course_path, exist_ok=True)
+                
+                return course_path
+            else:
+                return self.teaching_faculty_path
+        
+        elif data_type in ['non_teaching_faculty', 'non_teaching_faculty_excel', 'non_teaching_faculty_resume_pdf']:
+            return self.non_faculty_path
+        
+        elif data_type == 'non_teaching_faculty_schedule':
+            # Non-teaching faculty schedules go to Non-Faculty folder
+            return self.non_faculty_path
+        
+        elif data_type in ['admin', 'admin_excel']:
+            return self.admin_path
+        
+        else:
+            # Default fallback
+            return self.base_path
+        
+    def get_or_create_collection_with_path(self, collection_name, data_type, metadata=None):
+        """Get or create collection with appropriate storage path"""
+        
+        # Get the appropriate storage path
+        storage_path = self.get_storage_path(data_type, metadata)
+        
+        # Create a new client for this specific path
+        client = chromadb.PersistentClient(path=storage_path)
+        
+        # Get or create the collection
+        try:
+            collection = client.get_collection(
+                name=collection_name,
+                embedding_function=self.embedding_function
+            )
+            print(f"📂 Loaded existing collection: {collection_name} from {storage_path}")
+        except:
+            collection = client.create_collection(
+                name=collection_name,
+                embedding_function=self.embedding_function
+            )
+            print(f"📂 Created new collection: {collection_name} in {storage_path}")
+        
+        # Store the collection reference with path info
+        self.collections[collection_name] = {
+            'collection': collection,
+            'client': client,
+            'path': storage_path
+        }
+        
+        return collection, client
+
+
     # ======================== INITIALIZATION & SETUP ========================
     
     def check_existing_data(self):
-        """Check if there's already data in ChromaDB"""
-        try:
-            existing_collections = self.list_collections()
-            if existing_collections:
-                print("🗃️ Found existing data in ChromaDB:")
-                for i, collection in enumerate(existing_collections, 1):
-                    # When listing collections, ensure we use the correct embedding function if we need to interact
-                    # with them beyond just getting count/name, though list_collections doesn't require it.
-                    count = collection.count() 
-                    collection_type = self.get_collection_type(collection.name)
-                    print(f"  {i}. {collection.name} - {collection_type} ({count} records)")
-                return existing_collections
-            return []
-        except Exception as e: # Catch specific exceptions if possible
-            print(f"Error checking existing data: {e}")
-            return []
+        """Check if there's already data in ChromaDB across all folders"""
+        all_collections = []
+        
+        # Check all main folders
+        folders_to_check = [
+            ("Teaching Faculty", self.teaching_faculty_path),
+            ("Non-Faculty", self.non_faculty_path), 
+            ("Admin", self.admin_path)
+        ]
+        
+        for folder_name, folder_path in folders_to_check:
+            if os.path.exists(folder_path):
+                # Check main folder
+                try:
+                    client = chromadb.PersistentClient(path=folder_path)
+                    collections = client.list_collections()
+                    for collection in collections:
+                        all_collections.append({
+                            'collection': collection,
+                            'client': client,
+                            'folder': folder_name,
+                            'path': folder_path
+                        })
+                        # Store in collections dict - FIX: Use the collection object directly
+                        self.collections[collection.name] = {
+                            'collection': collection,
+                            'client': client,
+                            'path': folder_path
+                        }
+                except Exception as e:
+                    print(f"Error checking {folder_name}: {e}")
+                
+                # Check department subfolders in Teaching Faculty
+                if folder_name == "Teaching Faculty":
+                    for item in os.listdir(folder_path):
+                        dept_path = os.path.join(folder_path, item)
+                        if os.path.isdir(dept_path) and item.startswith("Department_"):
+                            # Check department folder
+                            try:
+                                dept_client = chromadb.PersistentClient(path=dept_path)
+                                dept_collections = dept_client.list_collections()
+                                for collection in dept_collections:
+                                    all_collections.append({
+                                        'collection': collection,
+                                        'client': dept_client,
+                                        'folder': f"{folder_name}/{item}",
+                                        'path': dept_path
+                                    })
+                                    self.collections[collection.name] = {
+                                        'collection': collection,
+                                        'client': dept_client,
+                                        'path': dept_path
+                                    }
+                            except Exception as e:
+                                print(f"Error checking department {item}: {e}")
+                            
+                            # Check course subfolders
+                            for course_item in os.listdir(dept_path):
+                                course_path = os.path.join(dept_path, course_item)
+                                if os.path.isdir(course_path):
+                                    try:
+                                        course_client = chromadb.PersistentClient(path=course_path)
+                                        course_collections = course_client.list_collections()
+                                        for collection in course_collections:
+                                            all_collections.append({
+                                                'collection': collection,
+                                                'client': course_client,
+                                                'folder': f"{folder_name}/{item}/{course_item}",
+                                                'path': course_path
+                                            })
+                                            self.collections[collection.name] = {
+                                                'collection': collection,
+                                                'client': course_client,
+                                                'path': course_path
+                                            }
+                                    except Exception as e:
+                                        print(f"Error checking course {course_item}: {e}")
+        
+        if all_collections:
+            print("🗃️ Found existing organized data:")
+            for i, item in enumerate(all_collections, 1):
+                collection = item['collection']
+                count = collection.count()
+                collection_type = self.get_collection_type(collection.name)
+                print(f"  {i}. {collection_type} - {item['folder']} ({count} records)")
+            return all_collections
+        
+        return []
     
     def get_collection_type(self, name):
         """Enhanced collection type display with curriculum, admin and faculty support"""
@@ -114,8 +291,18 @@ class SmartStudentDataSystem:
             
             dept_display = dept.replace('unclassified', 'Unclassified').upper() if dept else ''
             
+            # INSTITUTIONAL IDENTITY collection type
+            if base_type == "institutional" and len(parts) >= 2 and parts[1] == "identity":
+                if len(parts) >= 3 and parts[2] == "mission" and len(parts) >= 4 and parts[3] == "vision":
+                    return "Institutional Identity - Mission Vision"
+                elif len(parts) >= 3:
+                    doc_type = parts[2].replace('_', ' ').title()
+                    return f"Institutional Identity - {doc_type}"
+                else:
+                    return "Institutional Identity"
+            
             # CURRICULUM collection type
-            if base_type == "curriculum":
+            elif base_type == "curriculum":
                 program = parts[2] if len(parts) > 2 else ""
                 program_display = program.upper() if program else 'GENERAL'
                 return f"Curriculum - {dept_display} {program_display}".strip()
@@ -237,34 +424,49 @@ class SmartStudentDataSystem:
         else:
             print("📂 No existing data found. Let's load some files first...")
             return self.load_new_data()
-        
+    
     # ======================== FILE MANAGEMENT ========================
     
     def is_valid(self, file):
         return (file.endswith('.xlsx') or file.endswith('.pdf')) and not file.startswith('~$')
     
+    # def list_available_files(self):
+    #     """List available files with smart type detection"""
+    #     all_files = []
+        
+    #     for folder in os.listdir(self.folder_dir):
+    #         file_dir = os.path.join(self.folder_dir, folder)
+    #         files = [f for f in os.listdir(file_dir) if self.is_valid(f)]
+            
+    #         for file in files:
+    #             all_files.append(file)
+            
+    #     if not all_files:
+    #         if self.debug:
+    #             print(f"❌ No Excel or PDF files found: {folder}")
+    #         return []
+            
+    #     if self.debug:
+    #         print("\n📁 Available Files:")
+    #     for i, file in enumerate(all_files, 1):
+    #         file_type = self.detect_file_type(file)
+    #         if self.debug:
+    #             print(f"  {i}. {file} - {file_type}")
+    
     def list_available_files(self):
         """List available files with smart type detection"""
-        all_files = []
-        
-        for folder in os.listdir(self.folder_dir):
-            file_dir = os.path.join(self.folder_dir, folder)
-            files = [f for f in os.listdir(file_dir) if self.is_valid(f)]
-            
-            for file in files:
-                all_files.append(file)
-            
-        if not all_files:
-            if self.debug:
-                print(f"❌ No Excel or PDF files found: {folder}")
+        files = [f for f in os.listdir('.') 
+                if (f.endswith('.xlsx') or f.endswith('.pdf')) and not f.startswith('~$')]
+
+        if not files:
+            print("❌ No Excel or PDF files found.")
             return []
-            
-        if self.debug:
-            print("\n📁 Available Files:")
-        for i, file in enumerate(all_files, 1):
+
+        print("\n📁 Available Files:")
+        for i, file in enumerate(files, 1):
             file_type = self.detect_file_type(file)
-            if self.debug:
-                print(f"  {i}. {file} - {file_type}")
+            print(f"  {i}. {file} - {file_type}")
+        return files
     
     def detect_file_type(self, filename):
         """Smart file type detection"""
@@ -328,6 +530,8 @@ class SmartStudentDataSystem:
             # Check content if filename is unclear
             if self.is_cor_pdf(filename):
                 return "COR Schedule (PDF)"
+            elif self.is_objectives_pdf(filename):
+                return "Institutional Objectives (PDF)"
             elif self.is_faculty_schedule_pdf(filename):
                 return "Faculty Schedule (PDF)"
             # NEW: Check for teaching faculty resume before general faculty
@@ -340,6 +544,168 @@ class SmartStudentDataSystem:
         
         return "Unknown"
     
+    
+    def is_mission_vision_pdf(self, filename):
+        """Check if PDF is a Mission & Vision document"""
+        try:
+            doc = fitz.open(filename)
+            first_page = doc[0].get_text().lower()
+            doc.close()
+            
+            # Mission & Vision specific indicators
+            mission_vision_indicators = [
+                "vision", "mission", "pambayang dalubhasaan", "pdm",
+                "premier higher education", "quality subsidized tertiary education",
+                "nationally competent", "competitive graduates"
+            ]
+            
+            # Must have both vision and mission
+            has_vision = "vision" in first_page
+            has_mission = "mission" in first_page
+            
+            # Check for institutional content
+            has_institutional_content = any(indicator in first_page for indicator in mission_vision_indicators)
+            
+            # Should NOT have other document types
+            exclusion_indicators = [
+                "student id", "subject code", "schedule", "curriculum", "faculty", "grades"
+            ]
+            has_exclusions = any(indicator in first_page for indicator in exclusion_indicators)
+            
+            is_mission_vision = has_vision and has_mission and has_institutional_content and not has_exclusions
+            
+            print(f"📄 Mission & Vision PDF detection for {filename}:")
+            print(f"   Has vision: {has_vision}")
+            print(f"   Has mission: {has_mission}")
+            print(f"   Has institutional content: {has_institutional_content}")
+            print(f"   Final result: {is_mission_vision}")
+            
+            return is_mission_vision
+            
+        except Exception as e:
+            print(f"❌ Error checking Mission & Vision PDF: {e}")
+            return False
+        
+    
+    def extract_mission_vision_pdf_info(self, filename):
+        """Extract Mission & Vision information from PDF"""
+        try:
+            doc = fitz.open(filename)
+            full_text = ""
+            for page in doc:
+                full_text += page.get_text() + "\n"
+            doc.close()
+            
+            print(f"📋 Extracting Mission & Vision from PDF: {filename}")
+            
+            lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+            
+            mission_vision_info = {
+                'institution_name': '',
+                'vision': '',
+                'mission': '',
+                'document_type': 'institutional_document'
+            }
+            
+            # Extract institution name (PDM)
+            for line in lines:
+                if any(keyword in line.upper() for keyword in ['PAMBAYANG DALUBHASAAN', 'PDM']):
+                    if 'PAMBAYANG DALUBHASAAN' in line.upper():
+                        mission_vision_info['institution_name'] = 'Pambayang Dalubhasaan ng Marilao (PDM)'
+                        break
+            
+            # Extract Vision and Mission sections
+            current_section = None
+            vision_lines = []
+            mission_lines = []
+            
+            for line in lines:
+                line_upper = line.upper().strip()
+                
+                if line_upper == 'VISION':
+                    current_section = 'vision'
+                    continue
+                elif line_upper == 'MISSION':
+                    current_section = 'mission'
+                    continue
+                elif line_upper in ['', 'VISION', 'MISSION'] or len(line.strip()) == 0:
+                    continue
+                
+                # Collect content for current section
+                if current_section == 'vision' and line.strip():
+                    vision_lines.append(line.strip())
+                elif current_section == 'mission' and line.strip():
+                    mission_lines.append(line.strip())
+            
+            # Join the lines
+            mission_vision_info['vision'] = ' '.join(vision_lines) if vision_lines else ''
+            mission_vision_info['mission'] = ' '.join(mission_lines) if mission_lines else ''
+            
+            print(f"📋 Extracted Mission & Vision: {len(mission_vision_info['vision'])} chars vision, {len(mission_vision_info['mission'])} chars mission")
+            
+            return mission_vision_info
+            
+        except Exception as e:
+            print(f"❌ Error extracting Mission & Vision PDF: {e}")
+            return None
+        
+    def process_mission_vision_pdf(self, filename):
+        """Process Mission & Vision PDF file"""
+        try:
+            mv_info = self.extract_mission_vision_pdf_info(filename)
+            if not mv_info:
+                print("❌ Could not extract mission & vision data from PDF")
+                return False
+            
+            formatted_text = self.format_mission_vision_info(mv_info)
+            
+            # Create metadata for institutional documents
+            metadata = {
+                'institution_name': mv_info.get('institution_name', 'Unknown Institution'),
+                'document_type': 'mission_vision',
+                'data_type': 'institutional_document',
+                'department': 'ADMINISTRATION',  # Place under administration
+                'content_type': 'institutional_policy'
+            }
+            
+            # Store with hierarchy - use curriculum naming for consistency
+            collection_name = "curriculum_administration_institutional"
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
+            )
+            
+            self.store_with_smart_metadata(collection, [formatted_text], [metadata])
+            self.collections[collection_name] = collection
+            
+            print(f"✅ Loaded mission & vision into: {collection_name}")
+            print(f"   🏛️ Institution: {metadata['institution_name']}")
+            print(f"   📋 Document Type: Mission & Vision Statement")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error processing mission & vision PDF: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+    def format_mission_vision_info(self, mv_info):
+        """Format mission & vision information"""
+        text = f"""INSTITUTIONAL MISSION & VISION
+
+    INSTITUTION: {mv_info.get('institution_name', 'Unknown Institution')}
+
+    VISION:
+    {mv_info.get('vision', 'Vision not available')}
+
+    MISSION:
+    {mv_info.get('mission', 'Mission not available')}
+
+    DOCUMENT TYPE: Institutional Policy Document
+    CATEGORY: Strategic Planning & Governance
+    """
+        return text.strip()
     
     # ======================== STUDENT GRADES PROCESSING ========================
 
@@ -751,8 +1117,20 @@ class SmartStudentDataSystem:
         
         for collection_name in student_collections:
             try:
-                collection = self.collections[collection_name]
-                all_docs = collection.get()
+                # FIX: Handle both dict and direct collection object formats
+                collection_data = self.collections[collection_name]
+                if isinstance(collection_data, dict):
+                    collection = collection_data['collection']
+                else:
+                    collection = collection_data
+                
+                # FIX: Use get() with proper parameters
+                all_docs = collection.get(
+                    include=['documents', 'metadatas']  # Specify what to include
+                )
+                
+                if not all_docs.get("metadatas"):
+                    continue
                 
                 for i, metadata in enumerate(all_docs["metadatas"]):
                     existing_id = str(metadata.get('student_id', '')).strip().upper()
@@ -774,6 +1152,7 @@ class SmartStudentDataSystem:
         print(f"❌ Student not found in any collection")
         return False, None
 
+    
     def process_student_grades_excel(self, filename):
         """Process Student Grades Excel with existence validation"""
         try:
@@ -812,30 +1191,59 @@ class SmartStudentDataSystem:
                 'existing_collection': existing_collection
             }
             
-            # Add grades to the existing student collection or create new grades collection
+            # 🔧 FIX: Add grades to the same hierarchical path as the student collection
             collection_name = f"{existing_collection}_grades"
             
-            try:
-                # Try to get existing grades collection
-                collection = self.client.get_collection(
-                    name=collection_name,
-                    embedding_function=self.embedding_function
-                )
-            except:
-                # Create new grades collection
-                collection = self.client.create_collection(
-                    name=collection_name,
-                    embedding_function=self.embedding_function
-                )
+            # 🔧 FIX: Get the proper storage path from the existing student collection
+            if existing_collection in self.collections:
+                existing_collection_data = self.collections[existing_collection]
+                if isinstance(existing_collection_data, dict):
+                    # Use the same path as the existing student collection
+                    existing_path = existing_collection_data['path']
+                    existing_client = existing_collection_data['client']
+                else:
+                    # Fallback to default path if we don't have path info
+                    existing_path = self.teaching_faculty_path
+                    existing_client = chromadb.PersistentClient(path=existing_path)
+            else:
+                # Fallback path
+                existing_path = self.teaching_faculty_path
+                existing_client = chromadb.PersistentClient(path=existing_path)
             
+            print(f"🔧 Using storage path: {existing_path}")
+            
+            # 🔧 FIX: Use the same client and path as the existing collection
+            try:
+                # Try to get existing grades collection from the same path
+                collection = existing_client.get_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_function
+                )
+                print(f"📂 Found existing grades collection: {collection_name}")
+            except:
+                # Create new grades collection in the same path
+                collection = existing_client.create_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_function
+                )
+                print(f"📂 Created new grades collection: {collection_name}")
+            
+            # Store the grades data
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
-            self.collections[collection_name] = collection
+            
+            # 🔧 FIX: Store collection reference with proper path info
+            self.collections[collection_name] = {
+                'collection': collection,
+                'client': existing_client,
+                'path': existing_path
+            }
             
             collection_type = self.get_collection_type(existing_collection)
             print(f"✅ Loaded student grades into: {collection_name}")
             print(f"   🎓 Student: {student_name} ({student_number})")
             print(f"   📚 Subjects: {metadata['total_subjects']}, GWA: {metadata['gwa']}")
             print(f"   🔗 Linked to: {collection_type}")
+            print(f"   📁 Stored in path: {existing_path}")
             return True
             
         except Exception as e:
@@ -2727,9 +3135,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             
             # Update the formatted text to show the determined department
@@ -3207,9 +3616,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             self.store_with_smart_metadata(collection, [faculty_data], [metadata])
             self.collections[collection_name] = collection
@@ -3335,17 +3745,28 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             base_name = "students"
         elif "cor" in file_type.lower() or "schedule" in file_type.lower():
             base_name = "schedules"
-        elif "curriculum" in file_type.lower():  # NEW
+        elif "curriculum" in file_type.lower():
             base_name = "curriculum"
         elif "teaching_faculty" in file_type.lower() or metadata.get('data_type') == 'teaching_faculty_excel':
             base_name = "faculty"
         elif "faculty" in file_type.lower():
             base_name = "faculty"
+        # ADD THIS NEW CASE:
+        elif "general_info" in file_type.lower() or metadata.get('data_type') == 'mission_vision_pdf':
+            base_name = "general_info"
         else:
             base_name = "data_collection"
 
+        if base_name == "general_info":
+            document_type = metadata.get('document_type', 'unknown')
+            
+            if document_type == 'mission_vision':
+                return "institutional_identity_mission_vision"
+            else:
+                return f"institutional_identity_{document_type}"
+        
         # For curriculum, organize by department and program
-        if base_name == "curriculum":
+        elif base_name == "curriculum":
             department = metadata.get('department', 'unknown').lower()
             program = metadata.get('program', 'general').lower()
             
@@ -3440,12 +3861,21 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             section = metadata.get('section', '').lower()
             
             if course and course != 'unknown':
-                course_match = re.match(r'^(BS[A-Z]{2,4}|AB[A-Z]{2,4}|B[A-Z]{2,4})', course.upper())
-                if course_match:
-                    course = course_match.group(1).lower()
-                elif re.match(r'^[A-Z]{2,6}$', course.upper()):
+                # Enhanced course validation - be more permissive
+                course_upper = course.upper()
+                
+                # Check for standard course patterns
+                if re.match(r'^(BS|AB|B)[A-Z]{2,6}$', course_upper):
+                    # Valid course code format
+                    course = course_upper.lower()
+                elif course_upper in ['BSCS', 'BSIT', 'BSHM', 'BSTM', 'BSOA', 'BECED', 'BTLE']:
+                    # Known valid courses
+                    course = course_upper.lower()
+                elif len(course_upper) >= 2 and course_upper.isalpha():
+                    # Any alphabetic course code with 2+ letters - keep as is
                     course = course.lower()
                 else:
+                    # Only use 'newcourse' for truly unrecognizable patterns
                     course = 'newcourse'
             else:
                 course = 'general'
@@ -3530,9 +3960,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             for collection_name, group_data in hierarchy_groups.items():
                 try:
                     # Use get_or_create_collection with the consistent embedding function
-                    collection = self.client.get_or_create_collection(
-                        name=collection_name, 
-                        embedding_function=self.embedding_function
+                    collection, client = self.get_or_create_collection_with_path(
+                        collection_name, 
+                        metadata.get('data_type', 'unknown'), 
+                        metadata
                     )
                     self.store_with_smart_metadata(collection, group_data['texts'], group_data['metadata'])
                     self.collections[collection_name] = collection
@@ -3558,18 +3989,21 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
     def store_with_smart_metadata(self, collection, texts, metadata_list):
         """Store embeddings with rich metadata for smart filtering"""
         for idx, (text, metadata) in enumerate(zip(texts, metadata_list)):
-            # The embedding is generated by the collection's embedding_function implicitly
-            # when you use collection.add. You don't need to explicitly call self.model.encode here.
-            # However, if you *were* to encode manually, you'd use self.model.encode(text).tolist()
-            
-            # Create unique ID with metadata info
             doc_id = f"{metadata.get('course', 'unknown')}_{metadata.get('section', 'unknown')}_{idx}_{datetime.now().timestamp()}"
             
             collection.add(
                 documents=[text],
-                metadatas=[metadata],  # Store metadata for filtering
+                metadatas=[metadata],
                 ids=[doc_id]
             )
+            
+    def store_collection_reference(self, collection_name, collection, client, storage_path):
+        """Store collection reference with its client and path"""
+        self.collections[collection_name] = {
+            'collection': collection,
+            'client': client,
+            'path': storage_path
+        }
             
     def smart_search_with_ai_reasoning(self, query, max_results=20):
         """True AI-powered smart search with contextual understanding"""
@@ -3577,12 +4011,18 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
         query_intent['query'] = query
         search_strategy = self.determine_search_strategy(query_intent)
         
-        print(f"🧠 AI Analysis: {query_intent['intent']} | Strategy: {search_strategy['type']}")
+        print(f"🔃  AI Analysis: {query_intent['intent']} | Strategy: {search_strategy['type']}")
         
         all_results = []
         
-        for name, collection_obj in self.collections.items():
+        for name, collection_data in self.collections.items():
             try:
+                # FIX: Handle both dict and direct collection object formats
+                if isinstance(collection_data, dict):
+                    collection_obj = collection_data['collection']
+                else:
+                    collection_obj = collection_data
+                
                 where_clause = self.build_smart_filters(query_intent, name)
                 search_results_count = max(1, max_results // 2 if not search_strategy['broad'] else max_results)
                 
@@ -3600,7 +4040,8 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                 try:
                     results = collection_obj.query(**query_params)
                 except Exception as query_error:
-                    print(f"⚠️ Skipping collection {name} due to query error: {query_error}")
+                    print(f"🔃 Skipping collection {name} due to query error: {query_error}")
+                    continue
                     # Try to reinitialize the collection
                     try:
                         collection_obj = self.client.get_collection(
@@ -3653,6 +4094,97 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
         
         print(f"🔍 Final results after sorting: {len(final_results)}")
         return final_results
+    
+    # Add this new method to refresh all collections
+    def refresh_all_collections(self):
+        """Refresh the collections dictionary with all existing collections"""
+        print("🔄 Refreshing collections...")
+        
+        # Clear current collections
+        self.collections = {}
+        
+        # Re-scan all folders and load collections
+        all_collections = []
+        
+        # Check all main folders
+        folders_to_check = [
+            ("Teaching Faculty", self.teaching_faculty_path),
+            ("Non-Faculty", self.non_faculty_path), 
+            ("Admin", self.admin_path)
+        ]
+        
+        for folder_name, folder_path in folders_to_check:
+            if os.path.exists(folder_path):
+                # Check main folder
+                try:
+                    client = chromadb.PersistentClient(path=folder_path)
+                    collections = client.list_collections()
+                    for collection in collections:
+                        all_collections.append({
+                            'collection': collection,
+                            'client': client,
+                            'folder': folder_name,
+                            'path': folder_path
+                        })
+                        # FIX: Store collection in the correct format
+                        self.collections[collection.name] = {
+                            'collection': collection,
+                            'client': client,
+                            'path': folder_path
+                        }
+                except Exception as e:
+                    print(f"Error checking {folder_name}: {e}")
+                
+                # Check department subfolders in Teaching Faculty
+                if folder_name == "Teaching Faculty":
+                    for item in os.listdir(folder_path):
+                        dept_path = os.path.join(folder_path, item)
+                        if os.path.isdir(dept_path) and item.startswith("Department_"):
+                            # Check department folder
+                            try:
+                                dept_client = chromadb.PersistentClient(path=dept_path)
+                                dept_collections = dept_client.list_collections()
+                                for collection in dept_collections:
+                                    all_collections.append({
+                                        'collection': collection,
+                                        'client': dept_client,
+                                        'folder': f"{folder_name}/{item}",
+                                        'path': dept_path
+                                    })
+                                    # FIX: Store collection in the correct format
+                                    self.collections[collection.name] = {
+                                        'collection': collection,
+                                        'client': dept_client,
+                                        'path': dept_path
+                                    }
+                            except Exception as e:
+                                print(f"Error checking department {item}: {e}")
+                            
+                            # Check course subfolders
+                            for course_item in os.listdir(dept_path):
+                                course_path = os.path.join(dept_path, course_item)
+                                if os.path.isdir(course_path):
+                                    try:
+                                        course_client = chromadb.PersistentClient(path=course_path)
+                                        course_collections = course_client.list_collections()
+                                        for collection in course_collections:
+                                            all_collections.append({
+                                                'collection': collection,
+                                                'client': course_client,
+                                                'folder': f"{folder_name}/{item}/{course_item}",
+                                                'path': course_path
+                                            })
+                                            # FIX: Store collection in the correct format
+                                            self.collections[collection.name] = {
+                                                'collection': collection,
+                                                'client': course_client,
+                                                'path': course_path
+                                            }
+                                    except Exception as e:
+                                        print(f"Error checking course {course_item}: {e}")
+        
+        print(f"🔄 Refreshed {len(self.collections)} collections")
+        return len(self.collections)
     
     def get_proper_hierarchy_display(self, collection_name, metadata):
         """Get proper hierarchy display for any collection type"""
@@ -4602,9 +5134,11 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                 extracted_data = self.extract_teaching_faculty_resume_pdf_info(filename)
             elif data_type == 'non_teaching_faculty_resume_pdf':
                 extracted_data = self.extract_non_teaching_faculty_resume_pdf_info(filename)
-            # ADD THIS NEW CASE:
             elif data_type == 'student_grades_pdf':
                 extracted_data = self.extract_student_grades_pdf_info(filename)
+            # ADD THIS NEW CASE:
+            elif data_type == 'mission_vision_pdf':
+                extracted_data = self.extract_mission_vision_pdf_info(filename)
             else:
                 print(f"❌ Unknown data type: {data_type}")
                 return False
@@ -4934,6 +5468,16 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                     print(f"   📊 Student Grades PDF: {metadata['student_name']} ({metadata['course']}) - {metadata['total_subjects']} subjects")
                 return metadata
             
+            elif data_type == 'mission_vision_pdf':
+                metadata = {
+                    'institution_name': extracted_data.get('institution_name', 'Unknown Institution'),
+                    'document_type': 'mission_vision',
+                    'data_type': 'mission_vision_pdf',
+                    'department': 'ADMINISTRATION'
+                }
+                print(f"   📊 Mission & Vision: {metadata['institution_name']}")
+                return metadata
+            
             else:
                 print(f"   ⚠️ Unknown data type: {data_type}")
                 return {'data_type': data_type}
@@ -4990,6 +5534,8 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                     return self.process_faculty_pdf(filename)
                 elif data_type in ['teaching_faculty_schedule', 'non_teaching_faculty_schedule']:
                     return self.process_faculty_schedule_pdf(filename)
+                elif data_type == 'mission_vision_pdf':
+                    return self.process_mission_vision_pdf(filename)
                 else:
                     return self.process_student_pdf(filename)
             
@@ -5057,64 +5603,67 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             return True
 
     # don't delete just incase for terminal testing    
-    # def handle_duplicate_found(self, filename, new_data, similar_records, data_type):
-    #     """Handle when duplicates are found"""
-    #     print(f"\n⚠️ DUPLICATE DETECTED!")
-    #     print(f"📁 File: {filename}")
-    #     print(f"📊 Data Type: {data_type.replace('_', ' ').title()}")
-    #     print(f"🔍 Found {len(similar_records)} similar record(s):")
+    def handle_duplicate_found(self, filename, new_data, similar_records, data_type):
+        """Handle when duplicates are found"""
+        print(f"\n⚠️ DUPLICATE DETECTED!")
+        print(f"📁 File: {filename}")
+        print(f"📊 Data Type: {data_type.replace('_', ' ').title()}")
+        print(f"🔍 Found {len(similar_records)} similar record(s):")
         
-    #     # Show existing records
-    #     for i, record in enumerate(similar_records, 1):
-    #         collection_type = self.get_collection_type(record['collection'])
-    #         print(f"\n   {i}. Similar record in: {collection_type}")
+        # Show existing records
+        for i, record in enumerate(similar_records, 1):
+            collection_type = self.get_collection_type(record['collection'])
+            print(f"\n   {i}. Similar record in: {collection_type}")
             
-    #         if data_type == 'student':
-    #             print(f"      Student ID: {record['metadata'].get('student_id', 'Unknown')}")
-    #             print(f"      Name: {record['metadata'].get('full_name', 'Unknown')}")
-    #             print(f"      Course: {record['metadata'].get('course', 'Unknown')}")
-    #         elif data_type in ['teaching_faculty', 'admin', 'non_teaching_faculty']:
-    #             print(f"      Name: {record['metadata'].get('full_name', 'Unknown')}")
-    #             print(f"      Department: {record['metadata'].get('department', 'Unknown')}")
-    #             print(f"      Position: {record['metadata'].get('position', 'Unknown')}")
-    #         elif data_type == 'cor_schedule':
-    #             print(f"      Course: {record['metadata'].get('course', 'Unknown')}")
-    #             print(f"      Year/Section: {record['metadata'].get('year_level', 'Unknown')}/{record['metadata'].get('section', 'Unknown')}")
-    #             print(f"      Adviser: {record['metadata'].get('adviser', 'Unknown')}")
-    #         elif data_type in ['teaching_faculty_schedule', 'non_teaching_faculty_schedule']:
-    #             print(f"      Staff: {record['metadata'].get('staff_name', record['metadata'].get('adviser_name', 'Unknown'))}")
-    #             print(f"      Department: {record['metadata'].get('department', 'Unknown')}")
+            if data_type == 'student':
+                print(f"      Student ID: {record['metadata'].get('student_id', 'Unknown')}")
+                print(f"      Name: {record['metadata'].get('full_name', 'Unknown')}")
+                print(f"      Course: {record['metadata'].get('course', 'Unknown')}")
+            elif data_type in ['teaching_faculty', 'admin', 'non_teaching_faculty']:
+                print(f"      Name: {record['metadata'].get('full_name', 'Unknown')}")
+                print(f"      Department: {record['metadata'].get('department', 'Unknown')}")
+                print(f"      Position: {record['metadata'].get('position', 'Unknown')}")
+            elif data_type == 'cor_schedule':
+                print(f"      Course: {record['metadata'].get('course', 'Unknown')}")
+                print(f"      Year/Section: {record['metadata'].get('year_level', 'Unknown')}/{record['metadata'].get('section', 'Unknown')}")
+                print(f"      Adviser: {record['metadata'].get('adviser', 'Unknown')}")
+            elif data_type in ['teaching_faculty_schedule', 'non_teaching_faculty_schedule']:
+                print(f"      Staff: {record['metadata'].get('staff_name', record['metadata'].get('adviser_name', 'Unknown'))}")
+                print(f"      Department: {record['metadata'].get('department', 'Unknown')}")
         
-    #     print(f"\n💡 What would you like to do?")
-    #     print(f"   1. 🚫 Skip loading (keep existing data)")
-    #     print(f"   2. 🔄 Replace existing data with new file")
-    #     print(f"   3. 📝 Load as new record anyway")
+        print(f"\n💡 What would you like to do?")
+        print(f"   1. 🚫 Skip loading (keep existing data)")
+        print(f"   2. 🔄 Replace existing data with new file")
+        print(f"   3. 📝 Load as new record anyway")
+        print(f"   4. 🔍 View detailed comparison")
         
-    #     while True:
-    #         try:
-    #             choice = input("\n👉 Choose option (1-4): ").strip()
+        while True:
+            try:
+                choice = input("\n👉 Choose option (1-4): ").strip()
                 
-    #             if choice == "1":
-    #                 print(f"✅ Skipped loading duplicate data from {filename}")
-    #                 return True
-    #             elif choice == "2":
-    #                 return self.replace_existing_record(filename, new_data, similar_records, data_type)
-    #             elif choice == "3":
-    #                 print(f"✅ Loading as new record...")
-    #                 return self.process_file_normally(filename, data_type)
-    #             else:
-    #                 print("❌ Invalid choice. Please enter 1, 2, 3.")
+                if choice == "1":
+                    print(f"✅ Skipped loading duplicate data from {filename}")
+                    return True
+                elif choice == "2":
+                    return self.replace_existing_record(filename, new_data, similar_records, data_type)
+                elif choice == "3":
+                    print(f"✅ Loading as new record...")
+                    return self.process_file_normally(filename, data_type)
+                elif choice == "4":
+                    self.show_detailed_comparison(new_data, similar_records, data_type)
+                    # Continue the loop to ask again
+                else:
+                    print("❌ Invalid choice. Please enter 1, 2, 3, or 4.")
                     
-    #         except KeyboardInterrupt:
-    #             print(f"\n❌ Cancelled. Skipping {filename}")
-    #             return False
-    #         except Exception as e:
-    #             print(f"❌ Error handling input: {e}")
-    #             return False
+            except KeyboardInterrupt:
+                print(f"\n❌ Cancelled. Skipping {filename}")
+                return False
+            except Exception as e:
+                print(f"❌ Error handling input: {e}")
+                return False
 
     def replace_existing_record(self, filename, new_data, similar_records, data_type):
         """Replace existing record with new data"""
-        print(f"testing data: {filename}")
         try:
             print(f"\n🔄 Replacing existing record(s)...")
             
@@ -5776,10 +6325,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
         return value
     
     def process_student_grades_pdf(self, filename):
-        """Process Student Grades PDF with existence validation"""
+        """Process Student Grades PDF with existence validation - FIXED VERSION"""
         try:
             grades_info = self.extract_student_grades_pdf_info(filename)
-            
+
             if not grades_info or not grades_info.get('grades'):
                 print("❌ Could not extract student grades data from PDF")
                 return False
@@ -5800,7 +6349,7 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Format grades data (reuse existing method)
             formatted_text = self.format_student_grades_enhanced(grades_info)
-            
+        
             # Create metadata
             metadata = {
                 'student_number': student_number,
@@ -5813,28 +6362,57 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                 'existing_collection': existing_collection
             }
             
-            # Add grades to collection (same logic as Excel)
+            # 🔧 FIX: Add grades to the same hierarchical path as the student collection
             collection_name = f"{existing_collection}_grades"
             
-            try:
-                collection = self.client.get_collection(
-                    name=collection_name,
-                    embedding_function=self.embedding_function
-                )
-            except:
-                collection = self.client.create_collection(
-                    name=collection_name,
-                    embedding_function=self.embedding_function
-                )
+            # 🔧 FIX: Get the proper storage path from the existing student collection
+            if existing_collection in self.collections:
+                existing_collection_data = self.collections[existing_collection]
+                if isinstance(existing_collection_data, dict):
+                    # Use the same path as the existing student collection
+                    existing_path = existing_collection_data['path']
+                    existing_client = existing_collection_data['client']
+                else:
+                    # Fallback to default path if we don't have path info
+                    existing_path = self.teaching_faculty_path
+                    existing_client = chromadb.PersistentClient(path=existing_path)
+            else:
+                # Fallback path
+                existing_path = self.teaching_faculty_path
+                existing_client = chromadb.PersistentClient(path=existing_path)
             
+            print(f"🔧 Using storage path: {existing_path}")
+            
+            # 🔧 FIX: Use the same client and path as the existing collection
+            try:
+                collection = existing_client.get_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_function
+                )
+                print(f"📂 Found existing grades collection: {collection_name}")
+            except:
+                collection = existing_client.create_collection(
+                    name=collection_name,
+                    embedding_function=self.embedding_function
+                )
+                print(f"📂 Created new grades collection: {collection_name}")
+            
+            # Store the grades data
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
-            self.collections[collection_name] = collection
+            
+            # 🔧 FIX: Store collection reference with proper path info
+            self.collections[collection_name] = {
+                'collection': collection,
+                'client': existing_client,
+                'path': existing_path
+            }
             
             collection_type = self.get_collection_type(existing_collection)
             print(f"✅ Loaded student grades (PDF) into: {collection_name}")
             print(f"   🎓 Student: {student_name} ({student_number})")
             print(f"   📚 Subjects: {metadata['total_subjects']}, GWA: {metadata['gwa']}")
             print(f"   🔗 Linked to: {collection_type}")
+            print(f"   📁 Stored in path: {existing_path}")
             return True
             
         except Exception as e:
@@ -6597,9 +7175,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
@@ -6828,23 +7407,34 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
         value = value.strip()
         
         if field == 'Program':
-            # Smart program extraction - use whatever is actually in the COR
+            # Enhanced program extraction - keep original format when possible
             value_upper = value.upper().strip()
             
             # Remove common prefixes/suffixes that aren't part of the actual program
             clean_value = re.sub(r'^(PROGRAM|COURSE|DEGREE)[:\s]*', '', value_upper)
             clean_value = re.sub(r'\s*(PROGRAM|COURSE|DEGREE)$', '', clean_value)
-            
-            # Remove extra whitespace and clean up
             clean_value = ' '.join(clean_value.split())
             
-            # If it's a reasonable length and contains letters, use it as-is
-            if 2 <= len(clean_value) <= 50 and re.search(r'[A-Z]', clean_value):
+            # Check for standard course patterns first
+            if re.match(r'^(BS|AB|B)[A-Z]{2,6}$', clean_value):
                 return clean_value
-            
-            # If original value is better, use that
-            if 2 <= len(value) <= 50:
-                return value.strip()
+            elif clean_value in ['BSCS', 'BSIT', 'BSHM', 'BSTM', 'BSOA', 'BECED', 'BTLE']:
+                return clean_value
+            elif 'COMPUTER SCIENCE' in clean_value:
+                return 'BSCS'
+            elif 'INFORMATION TECHNOLOGY' in clean_value:
+                return 'BSIT'
+            elif 'HOSPITALITY MANAGEMENT' in clean_value:
+                return 'BSHM'
+            elif 'TOURISM MANAGEMENT' in clean_value:
+                return 'BSTM'
+            elif 'OFFICE ADMINISTRATION' in clean_value:
+                return 'BSOA'
+            elif 'EDUCATION' in clean_value:
+                return 'BECED'
+            # If it's reasonable length and contains letters, use cleaned version
+            elif 2 <= len(clean_value) <= 50 and re.search(r'[A-Z]', clean_value):
+                return clean_value
             
             return None
         
@@ -7383,7 +7973,6 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
     def process_cor_excel(self, filename):
         """Enhanced COR Excel processing with intelligent format detection"""
         try:
-            # Try multiple approaches to detect COR format
             cor_info = self.extract_cor_excel_info_smart(filename)
             
             if not cor_info or not cor_info['program_info']['Program']:
@@ -7392,34 +7981,34 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                 
             formatted_text = self.format_cor_info_enhanced(cor_info)
             
-            # Create smart metadata - FIX: Convert list to string
             subject_codes_list = [course.get('Subject Code', '') for course in cor_info['schedule'] if course.get('Subject Code')]
-            subject_codes_string = ', '.join(subject_codes_list)  # Convert list to comma-separated string
+            subject_codes_string = ', '.join(subject_codes_list)
             
             metadata = {
                 'course': cor_info['program_info']['Program'],
                 'section': cor_info['program_info']['Section'],
                 'year_level': cor_info['program_info']['Year Level'],
                 'adviser': cor_info['program_info']['Adviser'],
-                'data_type': 'cor_excel',
-                'subject_codes': subject_codes_string,  # Now a string instead of list
-                'total_units': str(cor_info.get('total_units', '')),  # Ensure it's a string
-                'subject_count': len(cor_info['schedule']),  # Add subject count as metadata
+                'data_type': 'cor_schedule',  # Correct data_type for proper routing
+                'subject_codes': subject_codes_string,
+                'total_units': str(cor_info.get('total_units', '')),
+                'subject_count': len(cor_info['schedule']),
                 'department': self.detect_department_from_course(cor_info['program_info']['Program'])
             }
             
-            # Store with hierarchy
+            # Store with hierarchy - will go to proper department/course folder
             collection_name = self.create_smart_collection_name('schedules', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                'cor_schedule',  # Use correct data_type for proper folder routing
+                metadata
             )
+            
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
-            self.collections[collection_name] = collection
             
             hierarchy_path = f"{self.get_department_display_name(metadata['department'])} > {metadata['course']} > Year {metadata['year_level']} > Section {metadata['section']}"
             print(f"✅ Loaded COR schedule into: {collection_name}")
-            print(f"   📁 Hierarchy: {hierarchy_path}")
+            print(f"   📍 Hierarchy: {hierarchy_path}")
             print(f"   📚 Subjects: {metadata['subject_count']}, Total Units: {metadata['total_units']}")
             print(f"   📋 Subject Codes: {subject_codes_string}")
             return True
@@ -7453,9 +8042,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
         # Store with hierarchy
         collection_name = self.create_smart_collection_name('schedules', metadata)
         # Use get_or_create_collection with the consistent embedding function
-        collection = self.client.get_or_create_collection(
-            name=collection_name, 
-            embedding_function=self.embedding_function
+        collection, client = self.get_or_create_collection_with_path(
+            collection_name, 
+            metadata.get('data_type', 'unknown'), 
+            metadata
         )
         self.store_with_smart_metadata(collection, [formatted_text], [metadata])
         self.collections[collection_name] = collection
@@ -8200,9 +8790,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
@@ -8305,9 +8896,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
             # Use get_or_create_collection with the consistent embedding function
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
             self.collections[collection_name] = collection
@@ -8338,9 +8930,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
             # Use get_or_create_collection with the consistent embedding function
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             self.store_with_smart_metadata(collection, [faculty_data], [metadata])
             self.collections[collection_name] = collection
@@ -8388,9 +8981,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
             # Use get_or_create_collection with the consistent embedding function
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
             self.collections[collection_name] = collection
@@ -8438,9 +9032,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
             # Use get_or_create_collection with the consistent embedding function
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
             self.collections[collection_name] = collection
@@ -8885,9 +9480,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Store with hierarchy using schedules
             collection_name = self.create_smart_collection_name('schedules', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
             self.collections[collection_name] = collection
@@ -9351,17 +9947,18 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                 'adviser_name': adviser_name,
                 'full_name': adviser_name,
                 'department': self.standardize_department_name(department),
-                'data_type': 'teaching_faculty_schedule_excel',
+                'data_type': 'teaching_faculty_schedule',  # Fixed data_type
                 'faculty_type': 'schedule',
                 'total_subjects': len(faculty_schedule_info.get('schedule', [])),
                 'days_teaching': len(set(item.get('day', '') for item in faculty_schedule_info.get('schedule', []) if item.get('day')))
             }
             
-            # Store with hierarchy
+            # Store with hierarchy using the corrected path
             collection_name = self.create_smart_collection_name('faculty', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                'teaching_faculty_schedule',  # Use correct data_type
+                metadata
             )
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
             self.collections[collection_name] = collection
@@ -9731,7 +10328,6 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
         
         try:
             if ext == ".xlsx":
-                print(filename)
                 df_check = pd.read_excel(filename, header=None)
                 
                 # Check curriculum FIRST (most specific academic content)
@@ -9773,8 +10369,11 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                     return self.process_with_duplicate_check(filename, 'student')
                     
             elif ext == ".pdf":
+                if self.is_mission_vision_pdf(filename):
+                    print("📄 Detected as Mission & Vision PDF")
+                    return self.process_with_duplicate_check(filename, 'mission_vision_pdf')
                 # Check Student COR FIRST before regular COR
-                if self.is_student_cor_pdf(filename):
+                elif self.is_student_cor_pdf(filename):
                     print("📄 Detected as Student COR PDF")
                     return self.process_with_duplicate_check(filename, 'student_cor_schedule')
                 elif self.is_cor_pdf(filename):
@@ -10419,9 +11018,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             
             # Update the formatted text to show the determined department
@@ -10793,24 +11393,26 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                 'staff_name': staff_name,
                 'full_name': staff_name,
                 'department': self.standardize_non_teaching_department_name(department),
-                'data_type': 'non_teaching_faculty_schedule_excel',
+                'data_type': 'non_teaching_faculty_schedule',  # Fixed data_type
                 'faculty_type': 'non_teaching_schedule',
                 'total_shifts': len(faculty_schedule_info.get('schedule', [])),
                 'days_working': len(set(item.get('day', '') for item in faculty_schedule_info.get('schedule', []) if item.get('day')))
             }
             
-            # Store with hierarchy
+            # Store with hierarchy using the corrected path
             collection_name = self.create_smart_collection_name('faculty', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                'non_teaching_faculty_schedule',  # Use correct data_type
+                metadata
             )
+            
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
-            self.collections[collection_name] = collection
+            
             
             hierarchy_path = f"{self.get_non_teaching_department_display_name(metadata['department'])} > Non-Teaching Faculty Schedules"
             print(f"✅ Loaded non-teaching faculty schedule into: {collection_name}")
-            print(f"   📁 Hierarchy: {hierarchy_path}")
+            print(f"   📍 Hierarchy: {hierarchy_path}")
             print(f"   👨‍💼 Staff: {staff_name}")
             print(f"   📅 Shifts: {metadata['total_shifts']}, Days: {metadata['days_working']}")
             return True
@@ -11649,9 +12251,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('faculty', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
@@ -12173,9 +12776,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Store with hierarchy
             collection_name = self.create_smart_collection_name('curriculum', metadata)
-            collection = self.client.get_or_create_collection(
-                name=collection_name, 
-                embedding_function=self.embedding_function
+            collection, client = self.get_or_create_collection_with_path(
+                collection_name, 
+                metadata.get('data_type', 'unknown'), 
+                metadata
             )
             
             self.store_with_smart_metadata(collection, [formatted_text], [metadata])
@@ -12292,10 +12896,10 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
         """Search across all loaded collections"""
         all_results = []
         
-        for name, collection in self.collections.items():
+        for name, collection_info in self.collections.items():
             try:
-                # When querying, ChromaDB uses the embedding function associated with the collection.
-                # Ensure it's set during get_or_create_collection.
+                collection = collection_info['collection'] if isinstance(collection_info, dict) else collection_info
+                
                 results = collection.query(query_texts=[query], n_results=max_results)
                 if results["documents"] and results["documents"][0]:
                     for i, doc in enumerate(results["documents"][0]):
@@ -12590,70 +13194,71 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
     # ======================== USER INTERFACE ========================
     
     def show_search_options(self):
-        """Displays the main menu options to the user."""
-        print("\n" + "="*50)
-        print(" MAIN MENU")
-        print("="*50)
-        print("1. 🤖 Engage AI School Analyst (Recommended)")
-        print("2. 📂 Load More Data")
-        print("3. 🗑️ Manage Collections")
-        print("4. ⚙️ System Options")
-        print("5. ❌ Exit")
+        """Display search options to user with refreshed collection info"""
+        print("\n🔍 SEARCH OPTIONS:")
+        print("1. 🔎 Smart Search (AI-powered similarity)")
+        print("2. 🔍 Exact Match Search")
+        print("3. 📊 Browse by Collection")
+        print("4. 📂 Load More Data")
+        print("5. 📋 Show All Collections")
+        print("6. 🗑️ Manage Collections")
+        print("7. 🧹 Clean Existing Duplicates")
+        print("8. 🔧 Debug Search")
+        print("9. 🔧 Simple Search Debug")
+        print("10. ❌ Exit")
 
-        if self.collections:
-            print(f"\n📚 Loaded Collections:")
-            for name in self.collections.keys():
-                count = self.collections[name].count()
+        # Refresh collections to show accurate count
+        collection_count = self.refresh_all_collections()
+        
+        if collection_count > 0:
+            print(f"\n📄 Loaded Collections ({collection_count} total):")
+            
+            # Group collections by type for better display
+            collection_types = {}
+            for name, collection_data in self.collections.items():
+                if isinstance(collection_data, dict):
+                    collection = collection_data['collection']
+                else:
+                    collection = collection_data
+                    
                 collection_type = self.get_collection_type(name)
-                print(f"   • {collection_type} ({count} records)")
+                count = collection.count()
+                
+                if collection_type not in collection_types:
+                    collection_types[collection_type] = []
+                collection_types[collection_type].append(count)
+            
+            # Display grouped by type
+            for ctype, counts in sorted(collection_types.items()):
+                total_records = sum(counts)
+                num_collections = len(counts)
+                if num_collections == 1:
+                    print(f"   • {ctype} ({total_records} records)")
+                else:
+                    print(f"   • {ctype} ({num_collections} collections, {total_records} total records)")
+        else:
+            print("\n📄 No collections loaded yet. Use option 4 to load data.")
 
     # The smart_search and exact_search methods were updated in the previous turn
     # to ensure they call the correct methods. No further changes needed here.
     # The exact_search method also now takes input directly.
-
-    def browse_collections(self):
-        """Browse data by collection"""
-        if not self.collections:
-            print("❌ No collections available.")
-            return
-        
-        print(f"\n📚 Available Collections:")
-        collection_list = list(self.collections.keys())
-        for i, name in enumerate(collection_list, 1):
-            count = self.collections[name].count()
-            collection_type = self.get_collection_type(name)
-            print(f"  {i}. {collection_type} ({count} records)")
-        
-        try:
-            choice = int(input("\n🔢 Choose collection number: ").strip())
-            if 1 <= choice <= len(collection_list):
-                collection_name = collection_list[choice - 1]
-                collection_type = self.get_collection_type(collection_name)
-                query = input(f"\n🔍 Search in '{collection_type}': ").strip()
-                
-                if query:
-                    results = self.search_specific_collection(collection_name, query)
-                    if results:
-                        print(f"\n✅ Found {len(results)} results in {collection_type}:")
-                        for i, result in enumerate(results, 1):
-                            print(f"\n📄 Result {i}:")
-                            print("-" * 60)
-                            print(result)
-                    else:
-                        print("❌ No results found.")
-        except ValueError:
-            print("❌ Invalid input.")
 
     def show_all_collections(self):
         """Show detailed info about all collections"""
         if not self.collections:
             print("❌ No collections loaded.")
             return
-        
-        print(f"\n📊 COLLECTION DETAILS:")
+
+        print(f"\n📚 COLLECTION DETAILS:")
         print("=" * 60)
         
-        for name, collection in self.collections.items():
+        for name, collection_data in self.collections.items():
+            # FIX: Handle both dict and direct collection object formats
+            if isinstance(collection_data, dict):
+                collection = collection_data['collection']
+            else:
+                collection = collection_data
+                
             collection_type = self.get_collection_type(name)
             count = collection.count()
             print(f"\n📁 {collection_type}")
@@ -12662,7 +13267,6 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
             
             # Show sample data
             try:
-                # Use the consistent embedding function when getting sample data
                 sample = collection.get(limit=1) 
                 if sample["documents"]:
                     print(f"   Sample data:")
@@ -12676,7 +13280,6 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
         """Main menu to launch the AI Analyst."""
         if not self.data_loaded:
             if not self.quick_setup(): return
-             
             
         # This finds the directory where your main script is located.
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -12685,14 +13288,29 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
         
         while True:
             self.show_search_options()
+            
             try:
                 choice = input("\n💡 Choose an option: ").strip()
 
                 if choice == "1":
-                    # This is the new integration point from the README
-                    print("🚀 Initializing AI School Analyst...")
-                    llm_cfg = load_llm_config(mode=self.api_mode) 
-                    ai = AIAnalyst(self.collections, llm_cfg)
+                    # --- 1. Load the ENTIRE config.json file ---
+                    try:
+                        # This assumes 'config.json' is in the same directory
+                        with open("config.json", "r", encoding="utf-8") as f:
+                            full_config = json.load(f)
+                    except FileNotFoundError:
+                        print("❌ config.json not found! Cannot start AI Analyst.")
+                        continue # Go back to the menu
+
+                    # --- 2. Initialize AIAnalyst with the selected mode ---
+                    print(f"🚀 Initializing AI School Analyst in {self.api_mode.upper()} mode...")
+                    
+
+                    ai = AIAnalyst(
+                        collections=self.collections, 
+                        llm_config=full_config,
+                        execution_mode=self.api_mode # self.api_mode is our toggle
+                    )
                     ai.start_ai_analyst()
 
                 elif choice == "2":
@@ -12702,6 +13320,20 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                 elif choice == "4":
                     self.manage_system_options()
                 elif choice == "5":
+                    self.show_all_collections()
+                elif choice == "6":
+                    self.manage_collections()
+                elif choice == "7":
+                    self.scan_and_clean_existing_duplicates()
+                elif choice == "8":
+                    debug_query = input("🔧 Enter query to debug: ").strip()
+                    if debug_query:
+                        self.debug_search(debug_query)
+                elif choice == "9":
+                    debug_query = input("🔧 Enter simple search query: ").strip()
+                    if debug_query:
+                        self.debug_simple_search(debug_query)
+                elif choice == "10":
                     print("👋 Goodbye!")
                     break
                 else:
@@ -12762,6 +13394,170 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                     return value
         
         return None
+
+    # ======================== DEBUGGING TOOLS ========================
+
+
+    def is_mission_vision_pdf(self, filename):
+        """Check if PDF is a Mission & Vision document"""
+        try:
+            doc = fitz.open(filename)
+            first_page = doc[0].get_text().lower()
+            doc.close()
+            
+            # Mission & Vision specific indicators
+            mission_vision_indicators = [
+                "vision", "mission", "pambayang dalubhasaan", "pdm",
+                "premier higher education", "quality subsidized tertiary education",
+                "nationally competent", "competitive graduates"
+            ]
+            
+            # Must have both vision and mission
+            has_vision = "vision" in first_page
+            has_mission = "mission" in first_page
+            
+            # Check for institutional content
+            has_institutional_content = any(indicator in first_page for indicator in mission_vision_indicators)
+            
+            # Should NOT have other document types
+            exclusion_indicators = [
+                "student id", "subject code", "schedule", "grades", "objectives"
+            ]
+            has_exclusions = any(indicator in first_page for indicator in exclusion_indicators)
+            
+            is_mission_vision = has_vision and has_mission and has_institutional_content and not has_exclusions
+            
+            print(f"📄 Mission & Vision PDF detection for {filename}:")
+            print(f"   Has vision: {has_vision}")
+            print(f"   Has mission: {has_mission}")
+            print(f"   Has institutional content: {has_institutional_content}")
+            print(f"   Final result: {is_mission_vision}")
+            
+            return is_mission_vision
+            
+        except Exception as e:
+            print(f"❌ Error checking Mission & Vision PDF: {e}")
+            return False
+
+    def extract_mission_vision_pdf_info(self, filename):
+        """Extract Mission & Vision information from PDF"""
+        try:
+            doc = fitz.open(filename)
+            full_text = ""
+            for page in doc:
+                full_text += page.get_text() + "\n"
+            doc.close()
+            
+            print(f"📋 Extracting Mission & Vision from PDF: {filename}")
+            
+            lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+            
+            mission_vision_info = {
+                'institution_name': '',
+                'vision': '',
+                'mission': '',
+                'document_type': 'institutional_document'
+            }
+            
+            # Extract institution name (PDM)
+            for line in lines:
+                if any(keyword in line.upper() for keyword in ['PAMBAYANG DALUBHASAAN', 'PDM']):
+                    if 'PAMBAYANG DALUBHASAAN' in line.upper():
+                        mission_vision_info['institution_name'] = 'Pambayang Dalubhasaan ng Marilao (PDM)'
+                        break
+            
+            # Extract Vision and Mission sections
+            current_section = None
+            vision_lines = []
+            mission_lines = []
+            
+            for line in lines:
+                line_upper = line.upper().strip()
+                
+                if line_upper == 'VISION':
+                    current_section = 'vision'
+                    continue
+                elif line_upper == 'MISSION':
+                    current_section = 'mission'
+                    continue
+                elif line_upper in ['', 'VISION', 'MISSION'] or len(line.strip()) == 0:
+                    continue
+                
+                # Collect content for current section
+                if current_section == 'vision' and line.strip():
+                    vision_lines.append(line.strip())
+                elif current_section == 'mission' and line.strip():
+                    mission_lines.append(line.strip())
+            
+            # Join the lines
+            mission_vision_info['vision'] = ' '.join(vision_lines) if vision_lines else ''
+            mission_vision_info['mission'] = ' '.join(mission_lines) if mission_lines else ''
+            
+            print(f"📋 Extracted Mission & Vision: {len(mission_vision_info['vision'])} chars vision, {len(mission_vision_info['mission'])} chars mission")
+            
+            return mission_vision_info
+            
+        except Exception as e:
+            print(f"❌ Error extracting Mission & Vision PDF: {e}")
+            return None
+
+    def process_mission_vision_pdf(self, filename):
+        """Process Mission & Vision PDF file"""
+        try:
+            mv_info = self.extract_mission_vision_pdf_info(filename)
+            if not mv_info:
+                print("❌ Could not extract mission & vision data from PDF")
+                return False
+            
+            formatted_text = self.format_mission_vision_info(mv_info)
+            
+            # Create metadata for institutional documents
+            metadata = {
+                'institution_name': mv_info.get('institution_name', 'Unknown Institution'),
+                'document_type': 'mission_vision',
+                'data_type': 'mission_vision_pdf',
+                'department': 'INSTITUTIONAL_IDENTITY',
+                'content_type': 'institutional_policy'
+            }
+            
+            # Store with hierarchy - use general_info naming
+            collection_name = self.create_smart_collection_name('general_info', metadata)
+            collection = self.client.get_or_create_collection(
+                name=collection_name, 
+                embedding_function=self.embedding_function
+            )
+            
+            self.store_with_smart_metadata(collection, [formatted_text], [metadata])
+            self.collections[collection_name] = collection
+            
+            hierarchy_path = "Institutional Identity > Mission Vision"
+            print(f"✅ Loaded mission & vision into: {collection_name}")
+            print(f"   🏛️ Hierarchy: {hierarchy_path}")
+            print(f"   📋 Institution: {metadata['institution_name']}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error processing mission & vision PDF: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def format_mission_vision_info(self, mv_info):
+        """Format mission & vision information"""
+        text = f"""INSTITUTIONAL MISSION & VISION
+
+    INSTITUTION: {mv_info.get('institution_name', 'Unknown Institution')}
+
+    VISION:
+    {mv_info.get('vision', 'Vision not available')}
+
+    MISSION:
+    {mv_info.get('mission', 'Mission not available')}
+
+    DOCUMENT TYPE: Institutional Policy Document
+    CATEGORY: Strategic Planning & Governance
+    """
+        return text.strip()
     
     def debug_search(self, query):
         """Debug search to see what's happening"""
@@ -12785,6 +13581,155 @@ Guardian Contact: {student_data.get('guardian_contact', 'N/A')}
                     
             except Exception as e:
                 print(f"🔧 Error in collection {name}: {e}")
+    
+    def is_objectives_pdf(self, filename):
+        """Check if PDF is an Objectives document"""
+        try:
+            print(f"\n\n\n {filename}\n\n\n")
+            doc = fitz.open(filename)
+            first_page = doc[0].get_text().lower()
+            doc.close()
+            
+            # Objectives specific indicators
+            objectives_indicators = [
+                "objectives", "objective", "goals", "institutional objectives",
+                "inculcate", "impart knowledge", "offer relevant", "instill social awareness"
+            ]
+            
+            # Must have objectives content
+            has_objectives = "objectives" in first_page or "objective" in first_page
+            
+            # Check for institutional objectives content
+            has_institutional_content = any(indicator in first_page for indicator in objectives_indicators)
+            
+            # Should NOT have other document types
+            exclusion_indicators = [
+                "student id", "subject code", "schedule", "curriculum", "grades"
+            ]
+            has_exclusions = any(indicator in first_page for indicator in exclusion_indicators)
+            
+            is_objectives = has_objectives and has_institutional_content and not has_exclusions
+            
+            print(f"📄 Objectives PDF detection for {filename}:")
+            print(f"   Has objectives: {has_objectives}")
+            print(f"   Has institutional content: {has_institutional_content}")
+            print(f"   Final result: {is_objectives}")
+            
+            return is_objectives
+            
+        except Exception as e:
+            print(f"❌ Error checking Objectives PDF: {e}")
+            return False
+        
+    def extract_objectives_pdf_info(self, filename):
+        """Extract Objectives information from PDF"""
+        try:
+            doc = fitz.open(filename)
+            full_text = ""
+            for page in doc:
+                full_text += page.get_text() + "\n"
+            doc.close()
+            
+            print(f"📋 Extracting Objectives from PDF: {filename}")
+            
+            lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+            
+            objectives_info = {
+                'institution_name': 'Pambayang Dalubhasaan ng Marilao (PDM)',  # Default based on your context
+                'objectives': '',
+                'document_type': 'objectives',
+                'total_objectives': 0
+            }
+            
+            # Extract the full objectives content
+            objectives_content = []
+            capture_content = False
+            
+            for line in lines:
+                line_upper = line.upper().strip()
+                
+                # Start capturing after OBJECTIVES header
+                if line_upper == 'OBJECTIVES':
+                    capture_content = True
+                    continue
+                
+                # Capture all content after objectives header
+                if capture_content and line.strip():
+                    objectives_content.append(line.strip())
+            
+            # Join all objectives content
+            if objectives_content:
+                objectives_info['objectives'] = '\n'.join(objectives_content)
+                
+                # Count individual objectives (lines ending with semicolon or period)
+                objective_count = len([line for line in objectives_content 
+                                    if line.endswith(';') or line.endswith('.')])
+                objectives_info['total_objectives'] = objective_count
+            
+            print(f"📋 Extracted Objectives: {len(objectives_info['objectives'])} chars, {objectives_info['total_objectives']} objectives")
+            
+            return objectives_info
+            
+        except Exception as e:
+            print(f"❌ Error extracting Objectives PDF: {e}")
+            return None
+        
+    def process_objectives_pdf(self, filename):
+        """Process Objectives PDF file"""
+        try:
+            obj_info = self.extract_objectives_pdf_info(filename)
+            if not obj_info:
+                print("❌ Could not extract objectives data from PDF")
+                return False
+            
+            formatted_text = self.format_objectives_info(obj_info)
+            
+            # Create metadata for institutional objectives
+            metadata = {
+                'institution_name': obj_info.get('institution_name', 'Unknown Institution'),
+                'document_type': 'objectives',
+                'data_type': 'objectives_pdf',
+                'department': 'INSTITUTIONAL_IDENTITY',
+                'content_type': 'institutional_policy',
+                'total_objectives': obj_info.get('total_objectives', 0)
+            }
+            
+            # Store with hierarchy - use general_info naming
+            collection_name = self.create_smart_collection_name('general_info', metadata)
+            collection = self.client.get_or_create_collection(
+                name=collection_name, 
+                embedding_function=self.embedding_function
+            )
+            
+            self.store_with_smart_metadata(collection, [formatted_text], [metadata])
+            self.collections[collection_name] = collection
+            
+            hierarchy_path = "Institutional Identity > Objectives"
+            print(f"✅ Loaded objectives into: {collection_name}")
+            print(f"   🏛️ Hierarchy: {hierarchy_path}")
+            print(f"   📋 Institution: {metadata['institution_name']}")
+            print(f"   🎯 Total Objectives: {metadata['total_objectives']}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error processing objectives PDF: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+    def format_objectives_info(self, obj_info):
+        """Format objectives information"""
+        text = f"""INSTITUTIONAL OBJECTIVES
+
+    INSTITUTION: {obj_info.get('institution_name', 'Unknown Institution')}
+
+    OBJECTIVES ({obj_info.get('total_objectives', 0)} total):
+    {obj_info.get('objectives', 'Objectives not available')}
+
+    DOCUMENT TYPE: Institutional Policy Document
+    CATEGORY: Strategic Planning & Governance
+    """
+        return text.strip()
     
     def debug_simple_search(self, query):
         """Simple debug search"""
