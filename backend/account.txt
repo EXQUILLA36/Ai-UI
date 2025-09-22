@@ -1,8 +1,8 @@
 admin: account
 
-PDM = 
-email = 
-password =  
+PDM = PDM-2023-000414
+email = testadminaccount.pdm@gmail.com
+password =  TestAdmin!24
 
 non_faculty: account
 
